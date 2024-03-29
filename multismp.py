@@ -20,8 +20,7 @@ class MultiDetection(Detection):
 		self.color = color
 		self.name = name
 		self.color_bg = color_bg
-  
-	def produceExposureList(self, exposures, detected):
+	def produceExposureList(self, exposures, detected, ra_center = None, dec_center = None):
 		"""
 		The key difference between this and `findAllExposures` is that here I will assume that the list of exposures
 		already exists somewhere
@@ -36,6 +35,16 @@ class MultiDetection(Detection):
 		ccdlist["DETECTED"][np.isin(ccdlist["EXPNUM"], detected)] = True
 
 		self.exposures = tb.unique(ccdlist)
+		if ra_center is None:
+			self.ra_center = {}
+			self.dec_center = {}
+			for i in ccdlist['EXPNUM']:
+				self.ra_center[i] = self.ra 
+				self.dec_center[i] = self.dec 
+		else:
+			self.ra_center = ra_center
+			self.dec_center = dec_center
+
 
 	def findAllExposures(self, survey, detected, return_list=False, reduce_band=True):
 		"""
@@ -130,13 +139,18 @@ class MultiDetection(Detection):
 		self.source_matrix = []
 		self.x_cen = {}
 		self.y_cen = {}
+		self.x_source = {}
+		self.y_source = {}
+		
+
 		for i in self.exposures[self.exposures["DETECTED"]]:
-			self.x_cen[i['EXPNUM']], self.y_cen[i['EXPNUM']] = self.findPixelCoords(expnum = i['EXPNUM'],pmc=pmc, color=self.color[i['EXPNUM']])
+			self.x_cen[i['EXPNUM']], self.y_cen[i['EXPNUM']] = self.findPixelCoords(expnum = i['EXPNUM'],ccdnum = i['CCDNUM'], pmc=pmc, color=self.color[i['EXPNUM']], ra=self.ra_center[i['EXPNUM']], dec=self.dec_center[i['EXPNUM']])
+			self.x_source[i['EXPNUM']], self.y_source[i['EXPNUM']] = self.findPixelCoords(expnum = i['EXPNUM'],ccdnum = i['CCDNUM'],pmc=pmc, color=self.color[i['EXPNUM']])
 			try:
 				self.source_matrix.append(
 					construct_psf_source(
-						self.x_cen[i['EXPNUM']] + shift_x[i["EXPNUM"]],
-						self.y_cen[i['EXPNUM']] + shift_y[i["EXPNUM"]],
+						self.x_source[i['EXPNUM']] + shift_x[i["EXPNUM"]],
+						self.y_source[i['EXPNUM']] + shift_y[i["EXPNUM"]],
 						psf=self.psf[i["EXPNUM"]],
 						stampsize=size,
 						x_center=self.x_cen[i['EXPNUM']],
@@ -149,7 +163,7 @@ class MultiDetection(Detection):
 					self.source_matrix.append(np.zeros((size * size)))
 
 
-	def constructDesignMatrix(self, size, background=True):
+	def constructDesignMatrix(self, size, background=False):
 		"""
 		Constructs the design matrix for the solution.
 		size is the stamp size, sparse turns on the sparse solution
@@ -161,20 +175,25 @@ class MultiDetection(Detection):
 			ones = np.zeros((size * size, 1))
 
 		print("Background")
-		background = sp.block_diag(len(self.exposures) * [ones])
+		self.background = sp.block_diag(len(self.exposures) * [ones])
 	
 		self.ntot = len(self.exposures)
 		self.ndet = len(self.exposures[self.exposures["DETECTED"]])
-		psf_zeros = np.zeros((self.psf_matrix.shape[0], self.ndet))
+		self.psf_zeros = np.zeros((self.psf_matrix.shape[0], self.ndet))
 		for i in range(self.ndet):
-			psf_zeros[
+			self.psf_zeros[
 				(self.ntot - self.ndet + i) * size * size : (self.ntot - self.ndet + i + 1) * size * size, (self.ntot - self.ndet) + i
 			] = self.source_matrix[i]
 
 		print("Design")
 		self.design = sp.hstack(
-			[self.psf_matrix, background, psf_zeros], dtype="float64"
+			[self.psf_matrix, self.background, self.psf_zeros], dtype="float64"
 		)
+
+	def updateDesignMatrix(self, size, index):
+		self.psf_zeros[(self.ntot - self.ndet + index) * size * size : (self.ntot - self.ndet + index + 1) * size * size, (self.ntot - self.ndet) + index] = self.source_matrix[index]
+
+		self.design = sp.hstack([self.psf_matrix, self.background, self.psf_zeros], dtype="float64")
 
 	def solvePhotometry(self, res=True, err=True):
 		"""
@@ -184,12 +203,14 @@ class MultiDetection(Detection):
 		- err: defines if the errors should be computed (requires an expensive matrix inversion)
 		- sparse: turns on sparse routines. Less stable, possibly incompatible with `err`
 		"""
-		diag = sp.diags(np.sqrt(self.invwgt))
+		self.diag = sp.diags(np.sqrt(self.invwgt))
 		print("Product")
 
-		prod = diag.dot(self.design)
+		prod = self.diag.dot(self.design)
+		self.target = self.image * np.sqrt(self.invwgt)
 		print("Solving")
-		self.X = sp.linalg.lsqr(prod, self.image * np.sqrt(self.invwgt))[0]
+		self.lsqr = sp.linalg.lsqr(prod, self.target)
+		self.X = self.lsqr[0]
 		print("Solved")
 		self.flux = self.X[-self.ndet:]
 
@@ -327,7 +348,7 @@ class MultiDetection(Detection):
 		)
 
 	def minimizeChisq(
-		self, x_init, size=30, background=True, method="Powell"
+		self, x_init, size=30, background=False, method="Powell"
 	):
 		from scipy.optimize import minimize
 
@@ -362,6 +383,50 @@ class MultiDetection(Detection):
 		self.shifts = x_sol
 		return x_sol
 
+	def minimizeChisqPerStamp(
+		self, x_init, size=30, background=False, method="Powell"
+	):
+		from scipy.optimize import minimize
+
+		x_current = x_init
+		for i in range(self.ndet):
+			print(f"Minimizing {self.exposures[self.exposures['DETECTED']][i]['EXPNUM']}")
+  
+			sol_this = minimize(
+			chi2_perstamp,
+			x_init[2*i:2*i+2],
+			method=method,
+			args=(self, i, size),
+			options={"xtol": 0.01},
+		)
+   
+			x_current[2*i] = sol_this.x[0]
+			x_current[2*i+1] = sol_this.x[1]
+  
+		self.source_matrix = []
+		j = 0
+		for i in self.exposures[self.exposures["DETECTED"]]:
+			try:
+				self.source_matrix.append(construct_psf_source(
+						self.x_cen[i['EXPNUM']] + x_current[2*j],
+						self.y_cen[i['EXPNUM']] + x_current[2*j+1],
+						psf=self.psf[i["EXPNUM"]],
+						stampsize=size,
+						x_center=self.x_cen[i['EXPNUM']],
+						y_center=self.y_cen[i['EXPNUM']],
+						color = self.color[i['EXPNUM']]
+					))
+				j += 1 #this keeps track of indexing of x_sol
+				
+			except (OSError):
+					print(i['EXPNUM'])
+					self.source_matrix.append(np.zeros((size * size)))
+		self.constructDesignMatrix(size, background)
+		self.solvePhotometry(True, True)
+		self.shifts = x_current
+		return x_current
+
+
 def chi2_multi(x, detection, size = 30, background = False):
 	j = 0	
 	detection.source_matrix = []
@@ -369,8 +434,16 @@ def chi2_multi(x, detection, size = 30, background = False):
 		detection.source_matrix.append(construct_psf_source(detection.x_cen[i['EXPNUM']] + x[j], detection.y_cen[i['EXPNUM']] + x[j+1], detection.psf[i['EXPNUM']], size, detection.x_cen[i['EXPNUM']], detection.y_cen[i['EXPNUM']]))
 		j += 2
 	detection.constructDesignMatrix(size, background)
-	detection.solvePhotometry(True, True)
+	detection.solvePhotometry(True, False)
 	chisq = np.sum(detection.res * detection.res * detection.invwgt)
 
 	return chisq 
 
+def chi2_perstamp(x, detection, stamp, size = 30,):
+	expnum = detection.exposures[detection.exposures['DETECTED']][stamp]['EXPNUM']
+	detection.source_matrix[stamp] = construct_psf_source(detection.x_cen[expnum] + x[0], detection.y_cen[expnum] + x[1], detection.psf[expnum], size, detection.x_cen[expnum], detection.y_cen[expnum])
+	detection.updateDesignMatrix(size,stamp)
+	prod = detection.diag.dot(detection.design)
+	detection.lsqr = sp.linalg.lsqr(prod, detection.target, x0 = detection.lsqr[0])
+
+	return detection.lsqr[3] 

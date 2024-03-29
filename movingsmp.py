@@ -146,6 +146,37 @@ class MovingDetection(MultiDetection):
 		self.solvePhotometry(True, True)
 
 
+class StackDetection(MovingDetection):       
+	'''
+	The main change between StackDetection and MovingDetection is that one assumes a single flux per obj, vs multiple.
+	This only requires changing the design matrix
+	'''
+	def constructDesignMatrix(self, size, background=True):
+		"""
+		Constructs the design matrix for the solution.
+		size is the stamp size, sparse turns on the sparse solution
+		background defines whether the background is being fit together with the image or not
+		"""
+		if not background:
+			ones = np.ones((size * size, 1))
+		else:
+			ones = np.zeros((size * size, 1))
+
+		print("Background")
+		background = sp.block_diag(len(self.exposures) * [ones])
+
+		self.ntot = len(self.exposures)
+		self.ndet = len(self.exposures[self.exposures["DETECTED"]])
+		psf_zeros = np.zeros((self.psf_matrix.shape[0], 1))
+		for i in range(self.ndet):
+			psf_zeros[(self.ntot - self.ndet + i) * size * size : (self.ntot - self.ndet + i + 1) * size * size, 0] = self.source_matrix[i]
+
+		print("Design")
+		self.design = sp.hstack(
+			[self.psf_matrix, background, psf_zeros], dtype="float64"
+		)
+
+
 def chi2_moving(x, detection, size = 30, background = False):
 	detection.source_matrix = []
 	for i in detection.exposures[detection.exposures['DETECTED']]: 
@@ -165,6 +196,8 @@ def chi2_moving(x, detection, size = 30, background = False):
 ## We also need to handle the case where there is a single flux measurement for the object
 ## this is more optimal for the small S/N case and will help with the minimization procedure 
 ## to find the best-fit rates
-## todo: covariance matrix for the rates?
+## StackDetection should fix this - I hope!
+
+## todo: covariance matrix for the rates? MCMC? HMC?
 ## todo: binary class
 

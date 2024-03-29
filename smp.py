@@ -177,6 +177,7 @@ class Detection:
 		'''
 		if expnum is None:
 			expnum = self.expnum
+		if ccdnum is None:
 			ccdnum = self.ccdnum
 
 		if ra is None:
